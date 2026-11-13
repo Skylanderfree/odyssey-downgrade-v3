@@ -26,6 +26,7 @@
 #include <core/title.h>
 #include <core/pfs.h>
 #include <core/romfs.h>
+#include <mbedtls/sha256.h>
 
 #define RESET   "\033[0m"
 #define BLACK   "\033[30m"      /* Black */
@@ -343,6 +344,11 @@ static bool check_sd_space(u64 required_size) {
     }
     return true;
 }
+typedef enum {
+    DUMP_ROMFS,
+    DUMP_EXEFS,
+    DUMP_BOTH
+} DumpMode;
 
 //checks the exefs.nsp checksum
 typedef struct
@@ -352,6 +358,7 @@ typedef struct
 } KnownHash;
 
 //checks known hashes at the moment
+// missing 1.0.1, 1.1.0, 1.2.0
 static const KnownHash known_exefs_hashes[] = {
     { "1.0.0 Physical",  "2a355aace93ebb99df97bdcc2da664d8c27434b5396adc1266b4753fadc378d7" },
     { "1.0.0 Physical",  "8d197e879e29936424b49def2b29cdaf18017d9796f48238f8794626df52b473" },
@@ -371,48 +378,79 @@ static void print_progress_bar(u8 percent) {
     consolePrint("\r[%s] %3u%%", bar, percent);
 }
 
-// Checksum runs to the end
-static bool calc_file_sha256(const char *path, char *out_hex, bool show_progress) {
-    const size_t chunk = 0x40000; // 256 KiB
-    bool ok = false;
-    u8 *buf = malloc(chunk);
-    FILE *f = fopen(path, "rb");
+// SHA-256 of the ExeFS stored inside the game itself (gamecard or installed digital copy).
+// It reads the ExeFS section straight out of the Program NCA, the same bytes the downgrader
+// dumps, but it never touches the exefs.nsp on the SD card. Not cancellable on purpose.
+#define HASH_BLOCK_SIZE (0x100000)
 
-    if (buf && f) {
-        fseek(f, 0, SEEK_END);
-        u64 total = (u64)ftell(f);
-        fseek(f, 0, SEEK_SET);
-        Sha256Context ctx;
-        sha256ContextCreate(&ctx);
-        u64 done = 0;
-        int last_percent = -1;
-        size_t n;
+static bool calculate_sha256(char *output, bool show_progress)
+{
+    bool success = false, sha_init = false, exefs_init = false;
+    TitleUserApplicationData user_app_data = {0};
+    NcaContext *nca_ctx = NULL;
+    PartitionFileSystemContext exefs_ctx = {0};
+    mbedtls_sha256_context sha_ctx;
+    u8 hash[SHA256_HASH_SIZE] = {0};
+    u8 *buf = NULL;
 
-        while ((n = fread(buf, 1, chunk, f)) > 0) {
-            sha256ContextUpdate(&ctx, buf, n);
-            done += n;
+    if (!output) return false;
+    output[0] = '\0';
 
-            if (show_progress && total) {
-                int percent = (int)((done * 100) / total);
-                if (percent != last_percent) {
-                    print_progress_bar((u8)percent);
-                    last_percent = percent;
-                }
-            }
-        }
+    if (!titleGetUserApplicationData(0x0100000000010000ull, &user_app_data) || !user_app_data.app_info) goto cleanup;
 
-        if (!ferror(f)) {
-            u8 hash[SHA256_HASH_SIZE];
-            sha256ContextGetHash(&ctx, hash);
-            for (u32 i = 0; i < SHA256_HASH_SIZE; i++) sprintf(out_hex + (i * 2), "%02x", hash[i]);
-            out_hex[SHA256_HASH_SIZE * 2] = '\0';
-            ok = true;
-        }
+    u32 program_count = titleGetContentCountByType(user_app_data.app_info, NcmContentType_Program);
+    if (!program_count) goto cleanup;
+
+    u8 program_id_offset = get_program_id_offset(user_app_data.app_info, program_count);
+    if (program_id_offset >= program_count) goto cleanup;
+
+    nca_ctx = calloc(1, sizeof(NcaContext));
+    buf = malloc(HASH_BLOCK_SIZE);
+    if (!nca_ctx || !buf) goto cleanup;
+
+    if (!ncaInitializeContext(
+      nca_ctx,
+      user_app_data.app_info->storage_id,
+      (user_app_data.app_info->storage_id == NcmStorageId_GameCard ? HashFileSystemPartitionType_Secure : 0),
+      &(user_app_data.app_info->meta_key),
+      titleGetContentInfoByTypeAndIdOffset(user_app_data.app_info, NcmContentType_Program, program_id_offset),
+      NULL
+    )) goto cleanup;
+
+    if (!pfsInitializeContext(&exefs_ctx, &(nca_ctx->fs_ctx[0]))) goto cleanup;
+    exefs_init = true;
+
+    mbedtls_sha256_init(&sha_ctx);
+    mbedtls_sha256_starts(&sha_ctx, 0);
+    sha_init = true;
+
+    for (u64 offset = 0, blksize = HASH_BLOCK_SIZE; offset < exefs_ctx.size; offset += blksize)
+    {
+        if ((exefs_ctx.size - offset) < blksize) blksize = (exefs_ctx.size - offset);
+
+        if (!ncaReadFsSection(&(nca_ctx->fs_ctx[0]), buf, blksize, exefs_ctx.offset + offset)) goto cleanup;
+
+        mbedtls_sha256_update(&sha_ctx, buf, blksize);
+
+        if (show_progress) print_progress_bar((u8)(((offset + blksize) * 100) / exefs_ctx.size));
     }
 
-    if (f) fclose(f);
-    free(buf);
-    return ok;
+    mbedtls_sha256_finish(&sha_ctx, hash);
+
+    for (u32 i = 0; i < SHA256_HASH_SIZE; i++) sprintf(output + (i * 2), "%02x", hash[i]);
+    output[SHA256_HASH_SIZE * 2] = '\0';
+
+    if (show_progress) consolePrint("\n");
+    success = true;
+
+cleanup:
+    if (sha_init) mbedtls_sha256_free(&sha_ctx);
+    if (exefs_init) pfsFreeContext(&exefs_ctx);
+    if (buf) free(buf);
+    if (nca_ctx) free(nca_ctx);
+    titleFreeUserApplicationData(&user_app_data);
+
+    return success;
 }
 
 // Returns the label of a matching known hash, or NULL.
@@ -423,21 +461,20 @@ static const char *find_known_hash_label(const char *hash)
     return NULL;
 }
 
-//refreshes g_exefsHash for the main menu
+//refreshes g_exefsHash for the main menu (hash of the game's own exefs, not the SD file)
 static void update_exefs_hash(void) {
     g_exefsHash[0] = '\0';
-    if (!utilsCheckIfFileExists(exefs_path)) return;
-    if (!calc_file_sha256(exefs_path, g_exefsHash, false)) g_exefsHash[0] = '\0';
+    if (!calculate_sha256(g_exefsHash, false)) g_exefsHash[0] = '\0';
 }
 
 static void verify_exefs_after_apply(void) {
 
     char hash[SHA256_HASH_SIZE * 2 + 1] = {0};
-    consolePrint("Verifying exefs.nsp\n");
+    consolePrint("Verifying game exefs\n");
 
-    if (calc_file_sha256(exefs_path, hash, true)) {
+    if (calculate_sha256(hash, true)) {
 
-        consolePrint(" exefs.nsp\n");
+        consolePrint(" game exefs\n");
         consolePrint("hash:%s\n", hash);
         const char *label = find_known_hash_label(hash);
         if (label) {
@@ -450,11 +487,11 @@ static void verify_exefs_after_apply(void) {
         }
     } 
         else {
-        consolePrint(RED "Failed to calculate exefs.nsp checksum\n" RESET);
+        consolePrint(RED "Failed to calculate game exefs checksum\n" RESET);
     }
 }
 
-bool do_add_downgrade() {
+bool do_add_downgrade(DumpMode dump_mode) {
     consoleClear();
 
     bool success = false;
@@ -516,8 +553,6 @@ bool do_add_downgrade() {
     if(!titleGetUserApplicationData(app_metadata[odysseyIdx]->title_id, &user_app_data) || !user_app_data.app_info) {
         consolePrint(BOLDYELLOW "Looks like odyssey is not detected\n" RESET);
         consolePrint(BOLDYELLOW "make sure that you have it installed or gamecard inserted\n" RESET);
-
-
         goto cleanup;
     }
 
@@ -565,22 +600,48 @@ bool do_add_downgrade() {
     }
     consolePrint("exefs initialize ctx succeeded\n");
 
-    u64 required_space = romfs_ctx.size + exefs_ctx.size + patch_data_size;
+    u64 required_space = 0;
+
+    if (dump_mode != DUMP_EXEFS)
+    required_space += romfs_ctx.size;
+
+    if (dump_mode != DUMP_ROMFS)
+    required_space += exefs_ctx.size;
+
+    if (dump_mode == DUMP_BOTH)
+    required_space += patch_data_size;
+
     if (!check_sd_space(required_space))
     {
-        goto cleanup;
+    goto cleanup;
     }
-
+    if (dump_mode == DUMP_EXEFS) {
+    shared_data.section_ctx = &(base_nca_ctx->fs_ctx[0]);
+    shared_data.total_offset = exefs_ctx.offset;
+    shared_data.total_size = exefs_ctx.size;
+    shared_data.mode = true;
+    }
+    else{
     shared_data.section_ctx = &(base_nca_ctx->fs_ctx[1]);
     shared_data.total_offset = romfs_ctx.offset;
     shared_data.total_size = romfs_ctx.size;
     shared_data.mode = false;
+    }
 
     shared_data.data = buf;
     shared_data.data_size = 0;
     shared_data.data_written = 0;
 
-    /* Output files (and ConcatenationFiles, when needed) are created by the read thread. */
+    consolePrint("creating file...");
+
+    const char *output_path = shared_data.mode ? exefs_path : romfs_path;
+
+    if (!utilsCreateConcatenationFile(output_path)) {
+        consolePrint("create concatenation file failed\n");
+        goto cleanup;
+    }
+
+    consolePrint("done\n");
 
 dump_start:
     consolePrint("creating threads\n");
@@ -599,19 +660,11 @@ dump_start:
     consolePrint(BOLDYELLOW "hold b to cancel\n\n" RESET);
 
     time_t start = time(NULL);
+
     while(shared_data.data_written < shared_data.total_size)
     {
         if (shared_data.read_error || shared_data.write_error) break;
-        //see if this can prevent crashes when pressing HOME for applet and title takeover
-        if (!appletMainLoop())
-        {
-            mutexLock(&g_fileMutex);
-            shared_data.transfer_cancelled = true;
-            mutexUnlock(&g_fileMutex);
-            condvarWakeAll(&g_readCondvar);
-            condvarWakeAll(&g_writeCondvar);
-            break;
-        }
+
         struct tm ts = {0};
         time_t now = time(NULL);
         localtime_r(&now, &ts);
@@ -652,7 +705,6 @@ dump_start:
         prev_size = size;
 
         printf("%lu / %lu (%u%%) | Time elapsed: %lu\n", size, shared_data.total_size, percent, (now - start));
-        fflush(stdout);
         consoleUpdate(NULL);
     }
 
@@ -666,32 +718,23 @@ dump_start:
 
     utilsSetLongRunningProcessState(false);
 
-    // Both threads are done: it is now safe to close the output file.
-    if (shared_data.fd)
+    if (shared_data.read_error || shared_data.write_error)
     {
-        fclose(shared_data.fd);
-        shared_data.fd = NULL;
+        consolePrint("i/o error\n");
+        goto cleanup;
     }
 
-    utilsCommitSdCardFileSystemChanges();
+    fclose(shared_data.fd);
 
-    if (shared_data.read_error || shared_data.write_error || shared_data.transfer_cancelled)
+    if (shared_data.transfer_cancelled)
     {
-        // Remove the partial output file
-        remove_sd_file_any(shared_data.mode ? exefs_path : romfs_path);
-
-        if (shared_data.transfer_cancelled)
-        {
-            consolePrint(BOLDRED "process cancelled\n" RESET);
-        } else {
-            consolePrint("i/o error\n");
-        }
+        consolePrint("process cancelled\n");
         goto cleanup;
     }
 
     consolePrint("process completed in %lu seconds\n", start);
 
-    if(shared_data.mode == false) {
+    if (dump_mode == DUMP_BOTH && shared_data.mode == false) {
         shared_data.section_ctx = &(base_nca_ctx->fs_ctx[0]);
         shared_data.total_offset = exefs_ctx.offset;
         shared_data.total_size = exefs_ctx.size;
@@ -750,7 +793,7 @@ void do_add_patch() {
 void do_add_downgrade_patch() {
     consoleClear();
     // If downgrade is cancelled then patch is not applied
-    if (!do_add_downgrade())
+    if (!do_add_downgrade(DUMP_BOTH))
     {
         consolePrint(RED "downgrade and patch have been cancelled\n" RESET);
         consolePrint("press any button to exit\n");
@@ -889,7 +932,7 @@ int main(int argc, char *argv[])
         if (g_exefsHash[0])
         {
             const char *label = find_known_hash_label(g_exefsHash);
-            printf("exefs.nsp sha256:\n%s\n", g_exefsHash);
+            printf("game exefs sha256:\n%s\n", g_exefsHash);
             if (label) printf(BOLDCYAN "Matches: %s\n" RESET, label);
             else printf(BOLDYELLOW "Unique hash\n" RESET);
         }
