@@ -927,7 +927,7 @@ int main(int argc, char *argv[])
         if(status & STATUS_DOWNGRADE) {
             printf(BOLDGREEN "Downgrade is already added.\n" RESET);
         } else {
-            printf(RED "Downgrade is not added.\n" RESET);
+            printf(BOLDRED "Downgrade is not added.\n" RESET);
         }
         if (g_exefsHash[0])
         {
@@ -984,7 +984,7 @@ int main(int argc, char *argv[])
                 }
             }
         } else
-        if (btn_down & HidNpadButton_Plus)
+        if ((btn_down & HidNpadButton_Plus) || (btn_down & HidNpadButton_Home))
         {
             break;
         }
