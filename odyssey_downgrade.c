@@ -984,7 +984,7 @@ int main(int argc, char *argv[])
                 }
             }
         } else
-        if ((btn_down & HidNpadButton_Plus) || (btn_down & HidNpadButton_Home))
+        if ((btn_down & HidNpadButton_Plus) || (btn_down & HiddbgNpadButton_Home))
         {
             break;
         }
